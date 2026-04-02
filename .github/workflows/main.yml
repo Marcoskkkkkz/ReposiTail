@@ -1,0 +1,273 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Duracao da sessao em minutos (max 310)'
+        required: false
+        default: '310'
+      warn_at:
+        description: 'Avisar no Discord quando restar X minutos'
+        required: false
+        default: '15'
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 340
+
+    steps:
+      - name: Verificar Permissao
+        run: |
+          $actor = "${{ github.actor }}"
+          $allowed = @("Laxjsdevi", "github-actions[bot]")
+          if ($allowed -notcontains $actor) {
+              Write-Error "Acesso negado! Tentativa de execucao por: $actor"
+              exit 1
+          }
+          Write-Host "Permissao concedida para: $actor"
+
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User
+        run: |
+          $password = "${{ secrets.RDP_PASSWORD }}"
+          Write-Output "::add-mask::$password"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=my-rdp
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned."; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      # =============================================================
+      # PERSISTENCIA DE ARQUIVOS COM RCLONE + GOOGLE DRIVE
+      # =============================================================
+
+      - name: Install Rclone
+        run: |
+          $rcloneUrl = "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          $zipPath = "$env:TEMP\rclone.zip"
+          $extractPath = "$env:TEMP\rclone"
+          Invoke-WebRequest -Uri $rcloneUrl -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+          $rcloneExe = Get-ChildItem -Path $extractPath -Recurse -Filter "rclone.exe" | Select-Object -First 1
+          Copy-Item $rcloneExe.FullName "C:\Windows\System32\rclone.exe"
+          Write-Host "Rclone instalado: $(rclone version)"
+
+      - name: Configure Rclone
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:APPDATA\rclone" | Out-Null
+          $configContent = [System.Text.Encoding]::UTF8.GetString(
+              [System.Convert]::FromBase64String("${{ secrets.RCLONE_CONFIG_B64 }}")
+          )
+          $configContent | Out-File -FilePath "$env:APPDATA\rclone\rclone.conf" -Encoding UTF8
+          Write-Host "Rclone configurado com sucesso."
+
+      - name: Restore Persistent Files from Google Drive
+        run: |
+          New-Item -ItemType Directory -Force -Path "C:\Persistent" | Out-Null
+          Write-Host "Garantindo que a pasta existe no Google Drive..."
+          rclone mkdir realz:rdp-persistent
+          Write-Host "Restaurando arquivos do Google Drive..."
+          rclone copy realz:rdp-persistent "C:\Persistent" `
+            --checksum `
+            --progress `
+            --transfers=8 `
+            --checkers=16 `
+            --log-level INFO
+          Write-Host "Arquivos restaurados! Conteudo de C:\Persistent:"
+          Get-ChildItem "C:\Persistent" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName, Length | Format-Table
+          Write-Host "Restauracao concluida."
+
+      - name: Create Desktop Shortcut to Persistent Folder
+        run: |
+          $desktopPath = "C:\Users\RDP\Desktop"
+          New-Item -ItemType Directory -Force -Path $desktopPath | Out-Null
+          $WshShell = New-Object -ComObject WScript.Shell
+          $Shortcut = $WshShell.CreateShortcut("$desktopPath\Meus Arquivos (Persistente).lnk")
+          $Shortcut.TargetPath = "C:\Persistent"
+          $Shortcut.Description = "Pasta de arquivos persistentes - salve aqui para nao perder!"
+          $Shortcut.Save()
+          Write-Host "Atalho criado na area de trabalho do usuario RDP."
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Notify Discord
+        run: |
+          $webhookUrl = "${{ secrets.DISCORD_WEBHOOK }}"
+          $body = [ordered]@{
+            username = "RDP Bot"
+            embeds = @(
+              [ordered]@{
+                title = "RDP Online!"
+                color = 65416
+                fields = @(
+                  [ordered]@{ name = "IP"; value = "$env:TAILSCALE_IP"; inline = $true }
+                  [ordered]@{ name = "Usuario"; value = "RDP"; inline = $true }
+                  [ordered]@{ name = "Senha"; value = "|| $env:RDP_PASS ||"; inline = $true }
+                  [ordered]@{ name = "Pasta"; value = "C:\Persistent"; inline = $false }
+                )
+                footer = [ordered]@{ text = "FAST RDP - GitHub Actions" }
+                timestamp = (Get-Date -Format "o")
+              }
+            )
+          } | ConvertTo-Json -Depth 10
+          Invoke-RestMethod -Uri $webhookUrl -Method POST -Body $body -ContentType "application/json"
+          Write-Host "Notificacao Discord enviada!"
+
+      - name: Maintain Connection with Periodic Sync
+        run: |
+          Write-Host "=== RDP ACCESS ==="
+          Write-Host "Address  : $env:TAILSCALE_IP"
+          Write-Host "Username : RDP"
+          Write-Host "Password : $env:RDP_PASS"
+          Write-Host "Pasta    : C:\Persistent"
+          Write-Host "=================="
+
+          $duration = [int]"${{ github.event.inputs.duration }}"
+          $warnAt  = [int]"${{ github.event.inputs.warn_at }}"
+          if ($duration -le 0 -or $duration -gt 310) { $duration = 310 }
+          if ($warnAt  -le 0 -or $warnAt  -gt $duration) { $warnAt  = 15 }
+
+          Write-Host "Duracao configurada: $duration min | Aviso em: $warnAt min restantes"
+
+          $endTime = (Get-Date).AddMinutes($duration)
+          $lastSync = Get-Date
+          $warningSent = $false
+
+          while ((Get-Date) -lt $endTime) {
+              $now = Get-Date
+              $remaining = $endTime - $now
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP Ativo | IP: $env:TAILSCALE_IP | Reinicio em: $([math]::Round($remaining.TotalMinutes)) min"
+
+              # Aviso de sessao encerrando
+              if ($remaining.TotalMinutes -le $warnAt -and -not $warningSent) {
+                  $warningSent = $true
+                  $webhookUrl = "${{ secrets.DISCORD_WEBHOOK }}"
+                  $warnBody = [ordered]@{
+                    username = "RDP Bot"
+                    embeds = @(
+                      [ordered]@{
+                        title = "Sessao encerrando em 15 minutos!"
+                        color = 16753920
+                        fields = @(
+                          [ordered]@{ name = "IP"; value = "$env:TAILSCALE_IP"; inline = $true }
+                        )
+                        footer = [ordered]@{ text = "FAST RDP - GitHub Actions" }
+                        timestamp = (Get-Date -Format "o")
+                      }
+                    )
+                  } | ConvertTo-Json -Depth 10
+                  Invoke-RestMethod -Uri $webhookUrl -Method POST -Body $warnBody -ContentType "application/json"
+                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Aviso de encerramento enviado ao Discord!"
+              }
+
+              # Sincroniza para o Google Drive a cada 5 minutos
+              if (($now - $lastSync).TotalMinutes -ge 5) {
+                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Sincronizando C:\Persistent com Google Drive..."
+                  rclone sync "C:\Persistent" realz:rdp-persistent --checksum --transfers=8 --log-level INFO
+                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Sincronizacao concluida!"
+                  $lastSync = Get-Date
+              }
+
+              Start-Sleep -Seconds 60
+          }
+
+          # Sync final antes de encerrar
+          Write-Host "[$(Get-Date -Format 'HH:mm:ss')] SYNC FINAL antes do encerramento..."
+          rclone sync "C:\Persistent" realz:rdp-persistent --checksum --transfers=8 --progress
+          if ($LASTEXITCODE -eq 0) {
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Sync final concluido com sucesso! Dados salvos no Drive."
+          } else {
+              Write-Error "[$(Get-Date -Format 'HH:mm:ss')] Sync final FALHOU (exit code $LASTEXITCODE). Verifique os arquivos!"
+          }
+          Write-Host "Sessao encerrada. Inicie um novo workflow manualmente quando precisar."
+
+      - name: Notify Discord Session Ended
+        if: success()
+        run: |
+          $webhookUrl = "${{ secrets.DISCORD_WEBHOOK }}"
+          $body = [ordered]@{
+            username = "RDP Bot"
+            embeds = @(
+              [ordered]@{
+                title = "Sessao RDP encerrada!"
+                color = 9807270
+                fields = @(
+                  [ordered]@{ name = "Duracao configurada"; value = "${{ github.event.inputs.duration }} min"; inline = $true }
+                  [ordered]@{ name = "Status"; value = "Encerrada normalmente"; inline = $true }
+                  [ordered]@{ name = "Arquivos"; value = "Salvos no Google Drive"; inline = $false }
+                )
+                footer = [ordered]@{ text = "FAST RDP - GitHub Actions" }
+                timestamp = (Get-Date -Format "o")
+              }
+            )
+          } | ConvertTo-Json -Depth 10
+          Invoke-RestMethod -Uri $webhookUrl -Method POST -Body $body -ContentType "application/json"
+          Write-Host "Notificacao de encerramento enviada ao Discord!"
+
+      - name: Notify Discord on Failure
+        if: failure()
+        run: |
+          $webhookUrl = "${{ secrets.DISCORD_WEBHOOK }}"
+          $failedStep = "${{ github.job }}"
+          $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          $body = [ordered]@{
+            username = "RDP Bot"
+            embeds = @(
+              [ordered]@{
+                title = "Workflow com falha!"
+                color = 15158332
+                fields = @(
+                  [ordered]@{ name = "Repositorio"; value = "${{ github.repository }}"; inline = $true }
+                  [ordered]@{ name = "Run ID"; value = "${{ github.run_id }}"; inline = $true }
+                  [ordered]@{ name = "Ver detalhes"; value = $runUrl; inline = $false }
+                )
+                footer = [ordered]@{ text = "FAST RDP - GitHub Actions" }
+                timestamp = (Get-Date -Format "o")
+              }
+            )
+          } | ConvertTo-Json -Depth 10
+          Invoke-RestMethod -Uri $webhookUrl -Method POST -Body $body -ContentType "application/json"
+          Write-Host "Notificacao de erro enviada ao Discord!"
